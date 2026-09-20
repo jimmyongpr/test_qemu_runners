@@ -1,0 +1,10 @@
+{
+  "name": "test-qemu-runners",
+  "version": "1.0.0",
+  "description": "Minimal Node.js static website",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "MIT"
+}

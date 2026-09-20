@@ -1,0 +1,108 @@
+name: Build and push to Docker Hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Architecture to build'
+        type: choice
+        default: both
+        options:
+          - both
+          - arm64
+          - amd64
+
+env:
+  IMAGE_NAME: test-qemu-runners
+
+jobs:
+  docker:
+    # GitHub-hosted arm64 runner: arm64 builds are native, amd64 goes through QEMU.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        # Skipped on PRs from forks, where secrets are not available.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Build and push
+        shell: bash
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+          PLATFORM: ${{ inputs.platform }}
+          PUSH: ${{ github.event_name != 'pull_request' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          CONTEXT="${CONTEXT:-.}"
+
+          # PLATFORM is only set by workflow_dispatch; other events build both.
+          case "${PLATFORM:-both}" in
+            both)  PLATFORMS="linux/amd64,linux/arm64" ;;
+            arm64) PLATFORMS="linux/arm64" ;;
+            amd64) PLATFORMS="linux/amd64" ;;
+            *)     echo "Unknown PLATFORM '${PLATFORM}' (want: both, arm64, amd64)" >&2; exit 1 ;;
+          esac
+
+          ref_name="${GITHUB_REF_NAME}"
+          ref_type="${GITHUB_REF_TYPE}"
+          sha="${GITHUB_SHA}"
+          short_sha="${sha:0:7}"
+
+          # Docker tags allow [A-Za-z0-9_.-] only; branch names like feat/foo need cleaning.
+          sanitize() { printf '%s' "$1" | tr '/' '-' | tr -cd 'A-Za-z0-9_.-'; }
+
+          tags=()
+          add_tag() { tags+=(--tag "${IMAGE}:$1"); }
+
+          add_tag "sha-${short_sha}"
+
+          if [[ "$ref_type" == "tag" && "$ref_name" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            add_tag "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+            add_tag "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            add_tag latest
+          elif [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            # GITHUB_REF_NAME is "<pr-number>/merge" on pull_request events.
+            add_tag "pr-${ref_name%%/*}"
+          else
+            add_tag "$(sanitize "$ref_name")"
+            if [[ "$ref_name" == "$DEFAULT_BRANCH" ]]; then
+              add_tag latest
+            fi
+          fi
+
+          args=(
+            buildx build "$CONTEXT"
+            --platform "$PLATFORMS"
+            --label "org.opencontainers.image.revision=${sha}"
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            --label "org.opencontainers.image.version=${ref_name}"
+            --cache-from "type=registry,ref=${IMAGE}:buildcache"
+          )
+
+          if [[ "$PUSH" == "true" ]]; then
+            # Writing the cache needs registry credentials, so only do it when pushing.
+            args+=(--push --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max")
+          else
+            echo "PUSH is not 'true' - building without pushing."
+          fi
+
+          echo "Image:     ${IMAGE}"
+          echo "Platforms: ${PLATFORMS}"
+          echo "Tags:      ${tags[*]//--tag /}"
+
+          set -x
+          docker "${args[@]}" "${tags[@]}"
